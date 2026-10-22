@@ -7,7 +7,10 @@
 
 用法：
     python muse_bridge.py auth                    # 打开浏览器，手动登录 muse.ai（只需一次）
-    python muse_bridge.py ask "帮我写一个快速排序"
+    python muse_bridge.py ask "帮我写一个快速排序"          # 默认新开一个会话，不进主要聊天
+    python muse_bridge.py ask --chat work "继续刚才的任务"  # 复用名为 work 的会话（上下文连续）
+    python muse_bridge.py ask --chat main "在主要聊天里问"  # 明确指定才用主要聊天
+    python muse_bridge.py chats                   # 查看已记录的命名会话
     python muse_bridge.py code --out ./myproject "写一个带登录的 Flask 待办应用"
     python muse_bridge.py serve                   # 启动本地 API，终端会打印 URL / key / model
     python muse_bridge.py inspect                 # 页面改版时 dump 结构，用于校准 SELECTORS
@@ -51,7 +54,30 @@ SELECTORS = {
     "send_button": ["button[aria-label*='Send']", "button[aria-label*='发送']"],
     "message": ["[data-message-author-role='assistant']", "article"],
     "streaming_indicator": ["button[aria-label*='Stop']", "button[aria-label*='停止']"],
+    "new_chat": [
+        "button[aria-label*='New chat']", "a[aria-label*='New chat']",
+        "button[aria-label*='New conversation']", "[data-testid*='new-chat']",
+        "button[aria-label*='新建']", "button[aria-label*='新对话']",
+    ],
 }
+
+# 命名会话登记表：名字 -> 会话页面 URL，存在本机，不进 git
+SESSIONS_FILE = Path(
+    os.environ.get("MUSE_BRIDGE_SESSIONS", str(Path.home() / ".muse-bridge-sessions.json"))
+)
+
+
+def load_sessions() -> dict:
+    try:
+        return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_session(name: str, url: str) -> None:
+    data = load_sessions()
+    data[name] = {"url": url, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    SESSIONS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 MODELS = [
     {"id": "muse-web", "object": "model", "created": 0, "owned_by": "muse-web-bridge"},
@@ -121,19 +147,84 @@ def _first_visible(page, selectors, timeout_ms: int = 3000):
     return None
 
 
-def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 600) -> str:
-    """在已登录的 muse.ai 页面发一条消息，等回复结束，返回最后一条回复文本。"""
+_SNAPSHOT_JS = """(selectors) => {
+  const out = { url: location.href, title: document.title, counts: {}, candidates: [] };
+  const seen = new Set();
+  for (const sel of selectors) {
+    let els = [];
+    try { els = Array.from(document.querySelectorAll(sel)); } catch (e) { els = []; }
+    out.counts[sel] = els.length;
+    for (const el of els) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      const t = (el.innerText || '').trim();
+      if (t) out.candidates.push(t.slice(0, 20000));
+    }
+  }
+  out.body_tail = (document.body ? document.body.innerText : '').slice(-6000);
+  return out;
+}"""
+
+
+def _snapshot(page) -> dict:
+    try:
+        return page.evaluate(_SNAPSHOT_JS, SELECTORS["message"])
+    except Exception:
+        return {"url": getattr(page, "url", ""), "title": "", "counts": {}, "candidates": [], "body_tail": ""}
+
+
+def _start_new_chat(page) -> bool:
+    """点“新建会话”按钮；找不到按钮返回 False（页面本身可能已是新会话）。"""
+    btn = _first_visible(page, SELECTORS["new_chat"], timeout_ms=1500)
+    if btn is None:
+        return False
+    try:
+        btn.click()
+        page.wait_for_timeout(1500)
+        return True
+    except Exception:
+        return False
+
+
+def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 300,
+             chat: str | None = None) -> str:
+    """发一条消息并等回复。
+
+    chat 取值：
+    - None（默认）：新开一个会话，不写进主要聊天；
+    - "main"：就在主要聊天里发；
+    - 其他名字：命名会话。登记过就打开那个会话继续聊，没登记过就新开一个并登记。
+    """
     ensure_deps()
     from playwright.sync_api import sync_playwright
+
+    sessions = load_sessions()
+    target_url = None
+    if chat == "main":
+        target_url = BASE_URL
+    elif chat and chat in sessions:
+        target_url = sessions[chat].get("url") or BASE_URL
 
     with sync_playwright() as pw:
         ctx = _launch_context(pw, headless=headless)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(BASE_URL)
+        page.goto(target_url or BASE_URL)
+        page.wait_for_timeout(2000)
+
+        if chat != "main" and not target_url:
+            if _start_new_chat(page):
+                print("已新开一个会话窗口。", flush=True)
+            else:
+                print("提示：没找到“新建会话”按钮，将在当前页面发送；"
+                      "如当前是主要聊天，可把 inspect 的 dump 发我校准。", flush=True)
+
         composer = _first_visible(page, SELECTORS["composer"], timeout_ms=10000)
         if composer is None:
+            _save_debug(page, None, "找不到输入框")
             ctx.close()
             raise NotLoggedIn("找不到消息输入框：可能未登录或登录已过期。先运行：python muse_bridge.py auth")
+
+        baseline = _snapshot(page)
         composer.click()
         if composer.evaluate("e => e.tagName === 'TEXTAREA'"):
             composer.fill(prompt)
@@ -144,35 +235,85 @@ def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 600) -> str:
             send.click()
         else:
             page.keyboard.press("Enter")
-        reply = _wait_reply(page, timeout_s)
+        print("已发送，正在等 Muse 回复…", flush=True)
+
+        reply = _wait_reply(page, prompt, baseline, timeout_s)
+        if chat and chat != "main":
+            try:
+                save_session(chat, page.url)
+            except Exception:
+                pass
         ctx.close()
         return reply
 
 
-def _wait_reply(page, timeout_s: int) -> str:
-    """等流式结束：回复文本连续两次不变且无 Stop 按钮，视为完成。"""
+def _pick_reply(snap: dict, baseline: dict, prompt: str) -> str:
+    """从页面快照里挑回复：优先取发送后新出现的消息元素；兜底用正文尾部里提问之后的部分。"""
+    base = baseline.get("candidates") or []
+    cands = snap.get("candidates") or []
+    for i in range(len(cands) - 1, len(base) - 1, -1):
+        t = cands[i]
+        if t and t != prompt and prompt not in t[:120]:
+            return t
+    if len(cands) == len(base) and cands:
+        # 没有新元素时，看最后一个元素是否在发送后变长/变了（原地更新的情况）
+        if cands[-1] != base[-1] and cands[-1] != prompt:
+            return cands[-1]
+    tail = snap.get("body_tail") or ""
+    idx = tail.rfind(prompt[:60])
+    if idx >= 0:
+        rest = tail[idx + len(prompt[:60]):].strip()
+        if len(rest) >= 2:
+            return rest
+    return ""
+
+
+def _wait_reply(page, prompt: str, baseline: dict, timeout_s: int) -> str:
+    """轮询页面快照：回复文本出现且连续 3 次不变，视为完成；全程有进度输出。"""
     deadline = time.time() + timeout_s
-    last_text, stable = "", 0
+    last_text, stable, first_seen = "", 0, 0.0
+    polls = 0
+    snap = baseline
     while time.time() < deadline:
-        streaming = _first_visible(page, SELECTORS["streaming_indicator"], timeout_ms=300)
-        msgs = page.locator(", ".join(SELECTORS["message"]))
-        text = ""
-        if msgs.count():
-            try:
-                text = msgs.last.inner_text(timeout=2000)
-            except Exception:
-                text = ""
-        if text and text == last_text and streaming is None:
-            stable += 1
-            if stable >= 2:
+        polls += 1
+        snap = _snapshot(page)
+        text = _pick_reply(snap, baseline, prompt)
+        now = time.time()
+        if text:
+            if not first_seen:
+                first_seen = now
+            if text == last_text:
+                stable += 1
+            else:
+                stable = 0
+                print(f"  回复生成中…已抓到 {len(text)} 字", flush=True)
+            last_text = text
+            if stable >= 3 and now - first_seen >= 4:
                 return text
-        else:
-            stable = 0
-        last_text = text
+        if polls % 5 == 0:
+            print(f"  等待回复中…已等 {int(now - (deadline - timeout_s))}s", flush=True)
         time.sleep(2)
     if last_text:
+        print("提示：等到超时，但已抓到部分回复，先返回现有内容。", flush=True)
         return last_text
-    raise TimeoutError(f"{timeout_s}s 内没有等到回复，请用 inspect 校准 SELECTORS。")
+    _save_debug(page, snap, "超时且未抓到回复")
+    raise TimeoutError(
+        f"{timeout_s}s 内没抓到回复。已把诊断文件存到脚本旁边的 muse_bridge_debug.json，"
+        "把这个文件发我，我按你页面的真实结构校准抓取逻辑。"
+    )
+
+
+def _save_debug(page, snap, reason: str) -> None:
+    try:
+        data = {"reason": reason, "snapshot": snap or _snapshot(page)}
+        (HERE / "muse_bridge_debug.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            page.screenshot(path=str(HERE / "muse_bridge_debug.png"))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def inspect_page() -> dict:
@@ -302,9 +443,16 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             raw = self.rfile.read(length) if length else b"{}"
             return json.loads(raw.decode("utf-8") or "{}")
 
-        def _ask(self, prompt: str) -> str:
+        def _ask(self, prompt: str, chat: str | None = None) -> str:
             with _ask_lock:  # 网页会话只能串行
-                return ask_fn(prompt)
+                try:
+                    return ask_fn(prompt, chat)
+                except TypeError:
+                    return ask_fn(prompt)
+
+        def _chat_of(self, payload: dict):
+            # 会话选择：请求体 session 字段 > 请求头 X-Muse-Chat > 服务默认
+            return payload.get("session") or self.headers.get("X-Muse-Chat")
 
         def do_GET(self):
             if self.path in ("/", "/health"):
@@ -352,7 +500,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 return
             prompt = _flatten_messages(payload.get("messages") or [])
             try:
-                reply = self._ask(prompt)
+                reply = self._ask(prompt, self._chat_of(payload))
             except Exception as e:
                 return self._error(502, f"调用 muse.ai 网页失败：{e}")
             cid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -407,7 +555,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 msgs = [{"role": "system", "content": system}] + msgs
             prompt = _flatten_messages(msgs)
             try:
-                reply = self._ask(prompt)
+                reply = self._ask(prompt, self._chat_of(payload))
             except Exception as e:
                 return self._error(502, f"调用 muse.ai 网页失败：{e}")
             self._send_json(200, {
@@ -424,7 +572,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             if not task:
                 return self._error(400, "缺 task")
             try:
-                reply = self._ask(f"{task}\n\n{CODE_INSTRUCTION}")
+                reply = self._ask(f"{task}\n\n{CODE_INSTRUCTION}", self._chat_of(payload))
             except Exception as e:
                 return self._error(502, f"调用 muse.ai 网页失败：{e}")
             files = [{"path": p, "content": c} for p, c in extract_blocks(reply)]
@@ -433,10 +581,15 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
     return Handler
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765, api_key: str | None = None) -> None:
+def serve(host: str = "127.0.0.1", port: int = 8765, api_key: str | None = None,
+          default_chat: str | None = None) -> None:
     ensure_deps()
     key = api_key or secrets.token_urlsafe(24)
-    httpd = ThreadingHTTPServer((host, port), make_handler(ask_muse, key))
+
+    def _ask(prompt: str, chat: str | None = None) -> str:
+        return ask_muse(prompt, chat=chat if chat is not None else default_chat)
+
+    httpd = ThreadingHTTPServer((host, port), make_handler(_ask, key))
     print("=" * 60)
     print("muse-web-bridge 已启动，填到你的工具里：")
     print(f"  API base URL : http://{host}:{port}/v1")
@@ -464,13 +617,20 @@ def main() -> None:
 
     p_ask = sub.add_parser("ask", help="发一条消息，打印回复")
     p_ask.add_argument("prompt")
+    p_ask.add_argument("--chat", default=None,
+                       help="会话窗口：不填=新开会话；填名字=复用同名会话；main=主要聊天")
+    p_ask.add_argument("--timeout", type=int, default=300, help="等回复的超时秒数（默认 300）")
     p_ask.add_argument("--show-browser", action="store_true", help="显示浏览器窗口")
 
     p_code = sub.add_parser("code", help="让 Muse 输出代码并落盘到 --out 目录")
     p_code.add_argument("task", help="开发任务描述")
     p_code.add_argument("--out", default="./out", help="代码输出目录")
+    p_code.add_argument("--chat", default=None, help="会话窗口，同 ask 的 --chat")
+    p_code.add_argument("--timeout", type=int, default=300, help="等回复的超时秒数（默认 300）")
     p_code.add_argument("--force", action="store_true", help="允许覆盖已存在文件")
     p_code.add_argument("--show-browser", action="store_true")
+
+    sub.add_parser("chats", help="列出已记录的命名会话")
 
     sub.add_parser("inspect", help="dump 页面结构概要到 inspect_dump.json，用于校准 SELECTORS")
 
@@ -479,17 +639,27 @@ def main() -> None:
     p_serve.add_argument("--port", type=int, default=8765)
     p_serve.add_argument("--api-key", default=None,
                          help="自定义 API key；不填则随机生成并打印（也可用环境变量 MUSE_BRIDGE_API_KEY）")
+    p_serve.add_argument("--chat", default=None,
+                         help="服务默认会话窗口；请求里带 session 字段或 X-Muse-Chat 头可逐次覆盖")
 
     args = ap.parse_args()
 
     if args.cmd == "auth":
         run_auth()
+    elif args.cmd == "chats":
+        data = load_sessions()
+        if not data:
+            print("还没有命名会话。用 ask --chat 名字 发一次就会自动创建并记录。")
+        for name, info in data.items():
+            print(f"{name}\t{info.get('url', '')}\t{info.get('updated_at', '')}")
     elif args.cmd == "ask":
-        reply = ask_muse(args.prompt, headless=not args.show_browser)
+        reply = ask_muse(args.prompt, headless=not args.show_browser,
+                         timeout_s=args.timeout, chat=args.chat)
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
         print(reply)
     elif args.cmd == "code":
-        reply = ask_muse(f"{args.task}\n\n{CODE_INSTRUCTION}", headless=not args.show_browser)
+        reply = ask_muse(f"{args.task}\n\n{CODE_INSTRUCTION}", headless=not args.show_browser,
+                         timeout_s=args.timeout, chat=args.chat)
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
         files = write_blocks(reply, args.out, force=args.force)
         print(f"完成：共写入 {len(files)} 个文件到 {args.out}")
@@ -502,7 +672,8 @@ def main() -> None:
         print(f"结构已存 {out}，按它修改脚本里的 SELECTORS 后再试 ask。")
     elif args.cmd == "serve":
         serve(host=args.host, port=args.port,
-              api_key=args.api_key or os.environ.get("MUSE_BRIDGE_API_KEY"))
+              api_key=args.api_key or os.environ.get("MUSE_BRIDGE_API_KEY"),
+              default_chat=args.chat)
 
 
 if __name__ == "__main__":

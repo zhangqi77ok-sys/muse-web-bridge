@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "muse-web-bridge"
+version = "0.2.0"
+description = "Unofficial local bridge for the muse.ai web app: reuse your own login via browser automation and expose a local OpenAI/Anthropic-compatible API for coding tools."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "playwright>=1.44",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+muse-bridge = "muse_bridge.cli:main"
+
+[tool.setuptools]
+packages = ["muse_bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

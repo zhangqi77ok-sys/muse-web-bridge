@@ -1,0 +1,27 @@
+# muse.ai 页面选择器 —— 初始值按常见聊天页面结构填写，
+# 尚未在登录态页面校准。定位失败时先跑 `python -m muse_bridge inspect`，
+# 按 dump 出的结构改这里，不要改代码。
+base_url: "https://muse.ai"
+
+# 消息输入框：依次尝试，第一个可见的命中即用
+composer:
+  - "div[contenteditable='true']"
+  - "textarea"
+
+# 发送方式：先试按钮，找不到就按 Enter
+send_button:
+  - "button[aria-label*='Send']"
+  - "button[aria-label*='发送']"
+
+# 一条助手回复的容器（提取最后一条的文本）
+message:
+  - "[data-message-author-role='assistant']"
+  - "article"
+
+# 流式输出进行中的指示（出现=还在生成，消失=结束）
+streaming_indicator:
+  - "button[aria-label*='Stop']"
+  - "button[aria-label*='停止']"
+
+# 已登录判定：能看到输入框即视为已登录
+logged_in_uses: composer

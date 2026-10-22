@@ -25,6 +25,8 @@ API 模式三要素（serve 启动时也会打印）：
 
 版本 0.4：回复实时同步——盯着页面，每 ~0.8 秒取一次最新文本，新出现的字立刻
 转发出来（CLI 实时打印、API 的 stream=true 为真流式），不等整段回复结束。
+版本 0.5：支持文件上传。CLI 用 --file（可多次）；API 在 messages 的 content 里
+放 file / document / image 的 base64 内容块即可，桥会解码成临时文件再随消息上传。
 """
 from __future__ import annotations
 
@@ -61,6 +63,11 @@ SELECTORS = {
         "button[aria-label*='New chat']", "a[aria-label*='New chat']",
         "button[aria-label*='New conversation']", "[data-testid*='new-chat']",
         "button[aria-label*='新建']", "button[aria-label*='新对话']",
+    ],
+    "attach_button": [
+        "button[aria-label*='Attach']", "button[aria-label*='Upload']",
+        "button[aria-label*='上传']", "button[aria-label*='附件']",
+        "[data-testid*='attach']", "[data-testid*='upload']",
     ],
 }
 
@@ -189,8 +196,44 @@ def _start_new_chat(page) -> bool:
         return False
 
 
+def _attach_files(page, files) -> None:
+    """把本地文件附加到当前会话：优先直接给 input[type=file] 赋值（不弹系统框），
+    找不到就先点附件按钮再赋值。"""
+    paths = [str(Path(f).expanduser().resolve()) for f in files]
+    for p in paths:
+        if not Path(p).exists():
+            raise FileNotFoundError(f"附件不存在：{p}")
+    done = False
+    inputs = page.locator("input[type='file']")
+    if inputs.count():
+        try:
+            inputs.first.set_input_files(paths)
+            done = True
+        except Exception:
+            done = False
+    if not done:
+        btn = _first_visible(page, SELECTORS["attach_button"], timeout_ms=2000)
+        if btn is not None:
+            try:
+                btn.click()
+            except Exception:
+                pass
+            page.wait_for_timeout(800)
+            inputs = page.locator("input[type='file']")
+            if inputs.count():
+                inputs.first.set_input_files(paths)
+                done = True
+    if not done:
+        raise RuntimeError(
+            "找不到文件上传入口（文件输入框和附件按钮都定位不到）。"
+            "运行 inspect 并把 inspect_dump.json 发我校准。")
+    total_mb = sum(Path(p).stat().st_size for p in paths) / 1e6
+    page.wait_for_timeout(int(min(30000, 3000 + total_mb * 1000)))
+    print(f"已附加 {len(paths)} 个文件，等待上传完成。", flush=True)
+
+
 def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 300,
-             chat: str | None = None, on_delta=None) -> str:
+             chat: str | None = None, on_delta=None, files=None) -> str:
     """发一条消息并等回复。
 
     chat 取值：
@@ -227,6 +270,8 @@ def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 300,
             ctx.close()
             raise NotLoggedIn("找不到消息输入框：可能未登录或登录已过期。先运行：python muse_bridge.py auth")
 
+        if files:
+            _attach_files(page, files)
         baseline = _snapshot(page)
         composer.click()
         if composer.evaluate("e => e.tagName === 'TEXTAREA'"):
@@ -365,6 +410,7 @@ def inspect_page() -> dict:
                 editables: pick(document.querySelectorAll("[contenteditable='true']")),
                 buttons: pick(document.querySelectorAll('button'), 50),
                 articles: pick(document.querySelectorAll('article')),
+                file_inputs: pick(document.querySelectorAll("input[type='file']")),
               };
             }"""
         )
@@ -434,6 +480,59 @@ def _est_tokens(text: str) -> int:
     return max(1, len(text) // 4)  # 粗略估算，仅用于填充 usage 字段
 
 
+def _extract_file_parts(messages):
+    """从 messages 的 content 里提取文件块，返回 [(文件名, base64或dataURL), ...]。
+
+    兼容三种写法：
+    - OpenAI：{"type":"file","file":{"filename":"a.pdf","file_data":"data:...;base64,xx"}}
+    - Anthropic：{"type":"document"|"image","source":{"type":"base64","media_type":"...","data":"xx"}}
+    - OpenAI 图片：{"type":"image_url","image_url":{"url":"data:image/png;base64,xx"}}
+    """
+    specs = []
+    for m in messages or []:
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "file":
+                f = c.get("file") or {}
+                data = f.get("file_data") or f.get("data") or ""
+                if data:
+                    specs.append((f.get("filename") or "upload.bin", data))
+            elif t in ("document", "image"):
+                src = c.get("source") or {}
+                if src.get("type") == "base64" and src.get("data"):
+                    ext = (src.get("media_type") or "application/octet-stream").split("/")[-1]
+                    specs.append((f"upload.{ext}", src["data"]))
+            elif t == "image_url":
+                url = (c.get("image_url") or {}).get("url") or ""
+                if url.startswith("data:") and "," in url:
+                    specs.append(("image.png", url))
+    return specs
+
+
+def _materialize_files(specs):
+    """把 base64 文件块解码成临时文件，返回 (路径列表, 临时目录)；无文件返回 ([], None)。"""
+    if not specs:
+        return [], None
+    import base64
+    import tempfile
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="muse-bridge-files-"))
+    paths = []
+    for name, data in specs:
+        if data.startswith("data:") and "," in data:
+            data = data.split(",", 1)[1]
+        safe = re.sub(r"[^\w.\- ]", "_", name) or "upload.bin"
+        p = tmpdir / safe
+        p.write_bytes(base64.b64decode(data))
+        paths.append(str(p))
+    return paths, tmpdir
+
+
 def make_handler(ask_fn: Callable[[str], str], api_key: str):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -464,15 +563,18 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             raw = self.rfile.read(length) if length else b"{}"
             return json.loads(raw.decode("utf-8") or "{}")
 
-        def _ask(self, prompt: str, chat: str | None = None, on_delta=None) -> str:
+        def _ask(self, prompt: str, chat: str | None = None, on_delta=None, files=None) -> str:
             with _ask_lock:  # 网页会话只能串行
                 try:
-                    return ask_fn(prompt, chat, on_delta)
+                    return ask_fn(prompt, chat, on_delta, files)
                 except TypeError:
                     try:
-                        return ask_fn(prompt, chat)
+                        return ask_fn(prompt, chat, on_delta)
                     except TypeError:
-                        return ask_fn(prompt)
+                        try:
+                            return ask_fn(prompt, chat)
+                        except TypeError:
+                            return ask_fn(prompt)
 
         def _chat_of(self, payload: dict):
             # 会话选择：请求体 session 字段 > 请求头 X-Muse-Chat > 服务默认
@@ -523,14 +625,21 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             if model is None:
                 return
             prompt = _flatten_messages(payload.get("messages") or [])
-            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-            created = int(time.time())
-            if payload.get("stream"):
-                return self._stream_live(cid, created, model, prompt, self._chat_of(payload))
+            files, tmpdir = _materialize_files(_extract_file_parts(payload.get("messages")))
             try:
-                reply = self._ask(prompt, self._chat_of(payload))
-            except Exception as e:
-                return self._error(502, f"调用 muse.ai 网页失败：{e}")
+                cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+                created = int(time.time())
+                if payload.get("stream"):
+                    return self._stream_live(cid, created, model, prompt,
+                                             self._chat_of(payload), files=files)
+                try:
+                    reply = self._ask(prompt, self._chat_of(payload), files=files)
+                except Exception as e:
+                    return self._error(502, f"调用 muse.ai 网页失败：{e}")
+            finally:
+                if tmpdir is not None:
+                    import shutil
+                    shutil.rmtree(tmpdir, ignore_errors=True)
             self._send_json(200, {
                 "id": cid, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{
@@ -545,7 +654,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 },
             })
 
-        def _stream_live(self, cid: str, created: int, model: str, prompt: str, chat):
+        def _stream_live(self, cid: str, created: int, model: str, prompt: str, chat, files=None):
             """真流式：页面上新出现的字经 on_delta 回调即时写成 SSE chunk 发出。"""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -563,7 +672,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 self.wfile.flush()
 
             try:
-                self._ask(prompt, chat, on_delta=lambda d: chunk(d))
+                self._ask(prompt, chat, on_delta=lambda d: chunk(d), files=files)
                 chunk(None, finish="stop")
             except Exception as e:
                 err = {"error": {"message": f"调用 muse.ai 网页失败：{e}", "type": "bridge_error"}}
@@ -582,12 +691,18 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             if system:
                 msgs = [{"role": "system", "content": system}] + msgs
             prompt = _flatten_messages(msgs)
-            if payload.get("stream"):
-                return self._anthropic_stream(model, prompt, self._chat_of(payload))
+            files, tmpdir = _materialize_files(_extract_file_parts(payload.get("messages")))
             try:
-                reply = self._ask(prompt, self._chat_of(payload))
-            except Exception as e:
-                return self._error(502, f"调用 muse.ai 网页失败：{e}")
+                if payload.get("stream"):
+                    return self._anthropic_stream(model, prompt, self._chat_of(payload), files=files)
+                try:
+                    reply = self._ask(prompt, self._chat_of(payload), files=files)
+                except Exception as e:
+                    return self._error(502, f"调用 muse.ai 网页失败：{e}")
+            finally:
+                if tmpdir is not None:
+                    import shutil
+                    shutil.rmtree(tmpdir, ignore_errors=True)
             self._send_json(200, {
                 "id": "msg_" + uuid.uuid4().hex[:24],
                 "type": "message", "role": "assistant", "model": model,
@@ -596,7 +711,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 "usage": {"input_tokens": _est_tokens(prompt), "output_tokens": _est_tokens(reply)},
             })
 
-        def _anthropic_stream(self, model: str, prompt: str, chat):
+        def _anthropic_stream(self, model: str, prompt: str, chat, files=None):
             """Anthropic 风格 SSE：页面新字即时以 content_block_delta 事件发出。"""
             mid = "msg_" + uuid.uuid4().hex[:24]
             self.send_response(200)
@@ -621,7 +736,7 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                                               "delta": {"type": "text_delta", "text": d}})
 
             try:
-                reply = self._ask(prompt, chat, on_delta=delta)
+                reply = self._ask(prompt, chat, on_delta=delta, files=files)
                 out_tokens = _est_tokens(reply)
             except Exception as e:
                 event("error", {"type": "error", "error": {"type": "bridge_error", "message": str(e)}})
@@ -654,9 +769,9 @@ def serve(host: str = "127.0.0.1", port: int = 8765, api_key: str | None = None,
     ensure_deps()
     key = api_key or secrets.token_urlsafe(24)
 
-    def _ask(prompt: str, chat: str | None = None, on_delta=None) -> str:
+    def _ask(prompt: str, chat: str | None = None, on_delta=None, files=None) -> str:
         return ask_muse(prompt, chat=chat if chat is not None else default_chat,
-                        on_delta=on_delta)
+                        on_delta=on_delta, files=files)
 
     httpd = ThreadingHTTPServer((host, port), make_handler(_ask, key))
     print("=" * 60)
@@ -689,6 +804,8 @@ def main() -> None:
     p_ask.add_argument("--chat", default=None,
                        help="会话窗口：不填=新开会话；填名字=复用同名会话；main=主要聊天")
     p_ask.add_argument("--timeout", type=int, default=300, help="等回复的超时秒数（默认 300）")
+    p_ask.add_argument("--file", action="append", default=None, dest="files",
+                       help="随消息上传的本地文件，可多次使用，如 --file a.pdf --file b.png")
     p_ask.add_argument("--show-browser", action="store_true", help="显示浏览器窗口")
 
     p_code = sub.add_parser("code", help="让 Muse 输出代码并落盘到 --out 目录")
@@ -696,6 +813,8 @@ def main() -> None:
     p_code.add_argument("--out", default="./out", help="代码输出目录")
     p_code.add_argument("--chat", default=None, help="会话窗口，同 ask 的 --chat")
     p_code.add_argument("--timeout", type=int, default=300, help="等回复的超时秒数（默认 300）")
+    p_code.add_argument("--file", action="append", default=None, dest="files",
+                        help="随任务上传的本地文件（需求文档、截图等），可多次使用")
     p_code.add_argument("--force", action="store_true", help="允许覆盖已存在文件")
     p_code.add_argument("--show-browser", action="store_true")
 
@@ -729,7 +848,8 @@ def main() -> None:
             print(delta, end="", flush=True)
 
         reply = ask_muse(args.prompt, headless=not args.show_browser,
-                         timeout_s=args.timeout, chat=args.chat, on_delta=_live)
+                         timeout_s=args.timeout, chat=args.chat, on_delta=_live,
+                         files=args.files)
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
         if streamed["seen"]:
             print()
@@ -738,7 +858,8 @@ def main() -> None:
     elif args.cmd == "code":
         reply = ask_muse(f"{args.task}\n\n{CODE_INSTRUCTION}", headless=not args.show_browser,
                          timeout_s=args.timeout, chat=args.chat,
-                         on_delta=lambda d: print(d, end="", flush=True))
+                         on_delta=lambda d: print(d, end="", flush=True),
+                         files=args.files)
         print()
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
         files = write_blocks(reply, args.out, force=args.force)

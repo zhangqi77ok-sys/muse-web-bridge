@@ -124,3 +124,12 @@ print(r.choices[0].message.content)
 - `muse_bridge/server.py` — 本地 API 服务（标准库实现，OpenAI/Anthropic 兼容）
 - `muse_bridge/cli.py` — `auth / ask / code / inspect / serve` 命令
 - `selectors.yaml` — 页面选择器，校准只改这个文件
+## 开发与测试
+
+```bash
+pip install PyYAML
+python -m unittest discover -s tests -v   # 11 个用例，不需要浏览器和 muse.ai 登录
+pip install .                              # 安装后可用 muse-bridge 命令
+```
+
+许可证：MIT，见 [LICENSE](LICENSE)。变更记录见 [CHANGELOG.md](CHANGELOG.md).

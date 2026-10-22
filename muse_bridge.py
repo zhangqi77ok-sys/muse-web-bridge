@@ -22,6 +22,9 @@ API 模式三要素（serve 启动时也会打印）：
 
 注意：muse.ai 网页版没有官方 API，这是浏览器自动化方案，复用你本人的登录态。
 登录态只存在本机 profile 目录（~/.muse-web-bridge-profile），脚本不保存你的密码。
+
+版本 0.4：回复实时同步——盯着页面，每 ~0.8 秒取一次最新文本，新出现的字立刻
+转发出来（CLI 实时打印、API 的 stream=true 为真流式），不等整段回复结束。
 """
 from __future__ import annotations
 
@@ -187,7 +190,7 @@ def _start_new_chat(page) -> bool:
 
 
 def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 300,
-             chat: str | None = None) -> str:
+             chat: str | None = None, on_delta=None) -> str:
     """发一条消息并等回复。
 
     chat 取值：
@@ -237,7 +240,7 @@ def ask_muse(prompt: str, headless: bool = True, timeout_s: int = 300,
             page.keyboard.press("Enter")
         print("已发送，正在等 Muse 回复…", flush=True)
 
-        reply = _wait_reply(page, prompt, baseline, timeout_s)
+        reply = _wait_reply(page, prompt, baseline, timeout_s, on_delta=on_delta)
         if chat and chat != "main":
             try:
                 save_session(chat, page.url)
@@ -268,9 +271,16 @@ def _pick_reply(snap: dict, baseline: dict, prompt: str) -> str:
     return ""
 
 
-def _wait_reply(page, prompt: str, baseline: dict, timeout_s: int) -> str:
-    """轮询页面快照：回复文本出现且连续 3 次不变，视为完成；全程有进度输出。"""
+def _wait_reply(page, prompt: str, baseline: dict, timeout_s: int, on_delta=None) -> str:
+    """实时同步轮询：每 ~0.8 秒取一次页面最新回复文本。
+
+    - 文本一增长就把新增部分通过 on_delta 立刻转发（真流式）；
+    - 文本连续 3 次轮询不变，视为生成完成，返回全文；
+    - 没给 on_delta 时退化为进度打印模式。
+    """
     deadline = time.time() + timeout_s
+    start = time.time()
+    emitted = ""
     last_text, stable, first_seen = "", 0, 0.0
     polls = 0
     snap = baseline
@@ -284,15 +294,26 @@ def _wait_reply(page, prompt: str, baseline: dict, timeout_s: int) -> str:
                 first_seen = now
             if text == last_text:
                 stable += 1
+                if stable >= 3 and now - first_seen >= 2:
+                    return text
             else:
                 stable = 0
-                print(f"  回复生成中…已抓到 {len(text)} 字", flush=True)
-            last_text = text
-            if stable >= 3 and now - first_seen >= 4:
-                return text
-        if polls % 5 == 0:
-            print(f"  等待回复中…已等 {int(now - (deadline - timeout_s))}s", flush=True)
-        time.sleep(2)
+                if on_delta is not None:
+                    if text.startswith(emitted):
+                        delta = text[len(emitted):]
+                        if delta:
+                            try:
+                                on_delta(delta)
+                            except Exception:
+                                pass
+                    # 页面重排版会让文本被重写，此时不对齐增量，重新以全文为准
+                    emitted = text
+                else:
+                    print(f"  回复生成中…已抓到 {len(text)} 字", flush=True)
+                last_text = text
+        elif on_delta is None and polls % 8 == 0:
+            print(f"  等待回复中…已等 {int(now - start)}s", flush=True)
+        time.sleep(0.8)
     if last_text:
         print("提示：等到超时，但已抓到部分回复，先返回现有内容。", flush=True)
         return last_text
@@ -443,12 +464,15 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             raw = self.rfile.read(length) if length else b"{}"
             return json.loads(raw.decode("utf-8") or "{}")
 
-        def _ask(self, prompt: str, chat: str | None = None) -> str:
+        def _ask(self, prompt: str, chat: str | None = None, on_delta=None) -> str:
             with _ask_lock:  # 网页会话只能串行
                 try:
-                    return ask_fn(prompt, chat)
+                    return ask_fn(prompt, chat, on_delta)
                 except TypeError:
-                    return ask_fn(prompt)
+                    try:
+                        return ask_fn(prompt, chat)
+                    except TypeError:
+                        return ask_fn(prompt)
 
         def _chat_of(self, payload: dict):
             # 会话选择：请求体 session 字段 > 请求头 X-Muse-Chat > 服务默认
@@ -499,14 +523,14 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             if model is None:
                 return
             prompt = _flatten_messages(payload.get("messages") or [])
+            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+            created = int(time.time())
+            if payload.get("stream"):
+                return self._stream_live(cid, created, model, prompt, self._chat_of(payload))
             try:
                 reply = self._ask(prompt, self._chat_of(payload))
             except Exception as e:
                 return self._error(502, f"调用 muse.ai 网页失败：{e}")
-            cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-            created = int(time.time())
-            if payload.get("stream"):
-                return self._stream(cid, created, model, reply)
             self._send_json(200, {
                 "id": cid, "object": "chat.completion", "created": created, "model": model,
                 "choices": [{
@@ -521,7 +545,8 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 },
             })
 
-        def _stream(self, cid: str, created: int, model: str, reply: str):
+        def _stream_live(self, cid: str, created: int, model: str, prompt: str, chat):
+            """真流式：页面上新出现的字经 on_delta 回调即时写成 SSE chunk 发出。"""
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -537,10 +562,13 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 self.wfile.write(f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
-            # 网页端本身是非流式取回的，这里把完整回复切块伪流式吐出，客户端体验一致
-            for i in range(0, len(reply), 200):
-                chunk(reply[i:i + 200])
-            chunk(None, finish="stop")
+            try:
+                self._ask(prompt, chat, on_delta=lambda d: chunk(d))
+                chunk(None, finish="stop")
+            except Exception as e:
+                err = {"error": {"message": f"调用 muse.ai 网页失败：{e}", "type": "bridge_error"}}
+                self.wfile.write(f"data: {json.dumps(err, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
             self.close_connection = True
@@ -554,6 +582,8 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
             if system:
                 msgs = [{"role": "system", "content": system}] + msgs
             prompt = _flatten_messages(msgs)
+            if payload.get("stream"):
+                return self._anthropic_stream(model, prompt, self._chat_of(payload))
             try:
                 reply = self._ask(prompt, self._chat_of(payload))
             except Exception as e:
@@ -565,6 +595,44 @@ def make_handler(ask_fn: Callable[[str], str], api_key: str):
                 "stop_reason": "end_turn", "stop_sequence": None,
                 "usage": {"input_tokens": _est_tokens(prompt), "output_tokens": _est_tokens(reply)},
             })
+
+        def _anthropic_stream(self, model: str, prompt: str, chat):
+            """Anthropic 风格 SSE：页面新字即时以 content_block_delta 事件发出。"""
+            mid = "msg_" + uuid.uuid4().hex[:24]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+
+            def event(name: str, obj: dict):
+                self.wfile.write(
+                    f"event: {name}\ndata: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            event("message_start", {"type": "message_start", "message": {
+                "id": mid, "type": "message", "role": "assistant", "model": model,
+                "content": [], "stop_reason": None,
+                "usage": {"input_tokens": _est_tokens(prompt), "output_tokens": 0}}})
+            event("content_block_start", {"type": "content_block_start", "index": 0,
+                                          "content_block": {"type": "text", "text": ""}})
+
+            def delta(d: str):
+                event("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                              "delta": {"type": "text_delta", "text": d}})
+
+            try:
+                reply = self._ask(prompt, chat, on_delta=delta)
+                out_tokens = _est_tokens(reply)
+            except Exception as e:
+                event("error", {"type": "error", "error": {"type": "bridge_error", "message": str(e)}})
+                self.close_connection = True
+                return
+            event("content_block_stop", {"type": "content_block_stop", "index": 0})
+            event("message_delta", {"type": "message_delta",
+                                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                                    "usage": {"output_tokens": out_tokens}})
+            event("message_stop", {"type": "message_stop"})
+            self.close_connection = True
 
         def _code(self, payload: dict):
             """便捷端点：{task} 进，{files:[{path,content}], raw} 出，不直接写盘。"""
@@ -586,8 +654,9 @@ def serve(host: str = "127.0.0.1", port: int = 8765, api_key: str | None = None,
     ensure_deps()
     key = api_key or secrets.token_urlsafe(24)
 
-    def _ask(prompt: str, chat: str | None = None) -> str:
-        return ask_muse(prompt, chat=chat if chat is not None else default_chat)
+    def _ask(prompt: str, chat: str | None = None, on_delta=None) -> str:
+        return ask_muse(prompt, chat=chat if chat is not None else default_chat,
+                        on_delta=on_delta)
 
     httpd = ThreadingHTTPServer((host, port), make_handler(_ask, key))
     print("=" * 60)
@@ -653,13 +722,24 @@ def main() -> None:
         for name, info in data.items():
             print(f"{name}\t{info.get('url', '')}\t{info.get('updated_at', '')}")
     elif args.cmd == "ask":
+        streamed = {"seen": False}
+
+        def _live(delta: str):
+            streamed["seen"] = True
+            print(delta, end="", flush=True)
+
         reply = ask_muse(args.prompt, headless=not args.show_browser,
-                         timeout_s=args.timeout, chat=args.chat)
+                         timeout_s=args.timeout, chat=args.chat, on_delta=_live)
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
-        print(reply)
+        if streamed["seen"]:
+            print()
+        else:
+            print(reply)
     elif args.cmd == "code":
         reply = ask_muse(f"{args.task}\n\n{CODE_INSTRUCTION}", headless=not args.show_browser,
-                         timeout_s=args.timeout, chat=args.chat)
+                         timeout_s=args.timeout, chat=args.chat,
+                         on_delta=lambda d: print(d, end="", flush=True))
+        print()
         (HERE / "last_reply.md").write_text(reply, encoding="utf-8")
         files = write_blocks(reply, args.out, force=args.force)
         print(f"完成：共写入 {len(files)} 个文件到 {args.out}")
